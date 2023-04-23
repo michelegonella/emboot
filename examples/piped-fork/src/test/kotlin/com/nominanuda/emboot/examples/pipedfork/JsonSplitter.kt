@@ -2,109 +2,157 @@ package com.nominanuda.emboot.examples.pipedfork
 
 import com.fasterxml.jackson.core.JsonFactory
 import com.fasterxml.jackson.core.JsonToken
-import com.fasterxml.jackson.core.JsonTokenId
+import com.fasterxml.jackson.core.JsonTokenId.*
 import com.fasterxml.jackson.core.json.async.NonBlockingJsonParser
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.util.TokenBuffer
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.lang.Exception
+import java.lang.IllegalStateException
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.function.Consumer
 
-private const val BUF_SIZE = 1024
+private const val BUF_SIZE = 4096
+
+private const val WAIT_FOR_INPUT_SLEEP = 1000L
+
 
 class JsonSplitter(
     val iStr: InputStream,
     val sink: Consumer<ByteArray>
 ) {
     val log = LoggerFactory.getLogger(JsonSplitter::class.java)
-    val fac = JsonFactory()
-    val p = fac.createNonBlockingByteArrayParser() as NonBlockingJsonParser
+    val jsonFactory = JsonFactory()
+    val jsonParser = jsonFactory.createNonBlockingByteArrayParser() as NonBlockingJsonParser
+    val resFut = CompletableFuture<Void>()
+    val quitLoop = AtomicBoolean(false)
+    var looping = false
+    //parser state
+    var objectNestingLevel  = -1
+    var waitingStartObject = true
+    var tokBuf = tokenBuffer()
+
     fun loop() : CompletableFuture<Void> {
-        val fut = CompletableFuture<Void>()
-        val bailOut = AtomicBoolean(false)
+        if (looping) {
+            throw IllegalStateException("already looping")
+        }
+        looping = true
         Thread {
-            var barr = ByteArray(BUF_SIZE)
-            while (true) {
-                if (bailOut.get()) {
-                    break
-                }
-                val nRead = iStr.read(barr)
-                if (bailOut.get()) {
-                    break
-                }
-                if (nRead < 0) {
-                    log.debug("inputstream closed")
-                    break;
-                } else if (nRead > 0) {
-                    while (! p.needMoreInput()) {
-                        log.debug("parser not ready bytes going to sleep")
-                        Thread.sleep(100)
-                    }
-                    p.feedInput(barr, 0, nRead)
-                } else {
-                    log.debug("got 0 bytes going to sleep")
-                    Thread.sleep(1000)
-                }
-                barr = ByteArray(BUF_SIZE)
-            }
-            p.endOfInput()
-            log.debug("END OF INPUT")
-        }.start()
-        Thread {
-            var level  = -1
-            var waitIngFirst = true
-            var tokBuf = TokenBuffer(ObjectMapper(), false)
-            var baos = ByteArrayOutputStream()
-            var gen = fac.createGenerator(baos)
-            while (!p.isClosed()) {
-                if (bailOut.get()) {
-                    break
-                }
-                val tok: JsonToken?  = p.nextToken()
-                if (tok == null) {
-                    log.debug("END OF PARSER")
-                    break
-                }
-                if (tok.id() == JsonTokenId.ID_NOT_AVAILABLE) {
-                    log.debug("NOT_AVAILABLE going to sleep")
-                    Thread.sleep(1000)
-                    continue;
-                }
-                tokBuf.copyCurrentEvent(p)
-                if (waitIngFirst) {
-                    if (tok.id() != JsonTokenId.ID_START_OBJECT) {
-                        bailOut.set(true)
-                        val ex = IllegalArgumentException("waiting for START_OBJECT but got ${tok.id()}")
-                        log.error("exiting stdin reading loop", ex)
-                        fut.completeExceptionally(ex)
+            var inputBuf: ByteArray
+            val bufsToFeed = ArrayList<Pair<ByteArray,Int>>()
+            try {
+                while (true) {
+                    if (quitLoop.get()) {
                         break
                     }
-                    waitIngFirst = false
-                }
-                if (tok.id() == JsonTokenId.ID_START_OBJECT) {
-                    level++
-                }
-                if (tok.id() == JsonTokenId.ID_END_OBJECT) {
-                    level--
-                    if ( level < 0) {
-                        tokBuf.serialize(gen)
-                        //ge =
-                        gen.close()
-                        sink.accept(baos.toByteArray())
-                        tokBuf = TokenBuffer(ObjectMapper(), false)
-                        baos = ByteArrayOutputStream()
-                        gen = fac.createGenerator(baos)
-                        waitIngFirst = true
+                    inputBuf = ByteArray(BUF_SIZE)
+                    val nRead = iStr.read(inputBuf)
+                    if (quitLoop.get()) {
+                        break
+                    }
+                    if (nRead < 0) {
+                        log.debug("input closed")
+                        quitLoop.set(true)
+                        continue
+                    } else if (nRead == 0) {
+                        log.debug("got 0 bytes going to sleep")
+                        Thread.sleep(WAIT_FOR_INPUT_SLEEP)
+                    } else {//nRead > 0
+                        bufsToFeed.add(Pair(inputBuf, nRead))
+                        if (jsonParser.needMoreInput()) {
+                            val (tot, bufToFeed) = concatAll(bufsToFeed)
+                            //assert equals sofar tot
+                            bufsToFeed.clear()
+                            jsonParser.feedInput(bufToFeed, 0, tot)
+                        }
+                        spinParserAndFeedOutput()
                     }
                 }
+                jsonParser.endOfInput()
+                log.debug("END OF INPUT")
             }
-            if (! fut.isDone) {
-                fut.complete(null)
+            catch (e: Exception) {
+                resFut.completeExceptionally(e)
+                log.error("unexpected exception reading input", e)
+            }
+            finally {
+                if (! resFut.isDone) {
+                    resFut.complete(null)
+                }
             }
         }.start()
-        return fut
+        return resFut
     }
+
+    private fun spinParserAndFeedOutput() {
+        while (true) {
+            val tok: JsonToken? = jsonParser.nextToken()
+            if (tok == null) {
+                val ex = IllegalStateException("nextToken() == null, invariant violated, bailing out input read loop")
+                log.error("nextToken() == null", ex)
+                resFut.completeExceptionally(ex)
+                quitLoop.set(true)
+                break
+            }
+            if (tok.id() == ID_NOT_AVAILABLE) {
+                log.debug("nextToken() NOT_AVAILABLE")
+                break
+            }
+            tokBuf.copyCurrentEvent(jsonParser)
+            if (waitingStartObject) {
+                if (tok.id() != ID_START_OBJECT) {
+                    quitLoop.set(true)
+                    val ex = IllegalArgumentException("waiting for START_OBJECT but got ${tok.id()}")
+                    log.error("exiting stdin reading loop", ex)
+                    resFut.completeExceptionally(ex)
+                    quitLoop.set(true)
+                    break
+                }
+                waitingStartObject = false
+            }
+            if (tok.id() == ID_START_OBJECT) {
+                objectNestingLevel++
+            }
+            if (tok.id() == ID_END_OBJECT) {
+                objectNestingLevel--
+                if (objectNestingLevel < 0) {
+                    val jsonObjectOutBytes = serializeTokenBuffer(tokBuf)
+                    sink.accept(jsonObjectOutBytes)
+                    tokBuf = tokenBuffer()
+                    waitingStartObject = true
+                }
+            }
+        }
+    }
+
+
+    private fun serializeTokenBuffer(tokBuf: TokenBuffer): ByteArray {
+        val jsonOutBaos = ByteArrayOutputStream()
+        val jacksonGen = jsonFactory.createGenerator(jsonOutBaos)
+        tokBuf.serialize(jacksonGen)
+        jacksonGen.close()
+        val jsonObjectOutBytes = jsonOutBaos.toByteArray()
+        return jsonObjectOutBytes
+    }
+
+    private fun concatAll(bufsToFeed: ArrayList<Pair<ByteArray, Int>>): Pair<Int, ByteArray> {
+        val tot = bufsToFeed.map { it.second }.sum()
+        val bufToFeed = ByteArray(tot)
+        var soFar = 0
+        bufsToFeed.forEach {
+            try {
+                System.arraycopy(it.first, 0, bufToFeed, soFar, it.second)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            soFar += it.second
+        }
+        return Pair(tot, bufToFeed)
+    }
+    private val objectMapper = ObjectMapper()
+    private fun tokenBuffer() = TokenBuffer(objectMapper, false)
+
 }
