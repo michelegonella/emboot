@@ -6,6 +6,7 @@ import com.fasterxml.jackson.core.JsonTokenId.*
 import com.fasterxml.jackson.core.json.async.NonBlockingJsonParser
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.util.TokenBuffer
+import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -21,18 +22,18 @@ private const val WAIT_FOR_INPUT_SLEEP = 1000L
 
 
 class JsonSplitter(
-    val iStr: InputStream,
-    val sink: Consumer<ByteArray>
+    private val iStr: InputStream,
+    private val sink: Consumer<ByteArray>
 ) {
-    val log = LoggerFactory.getLogger(JsonSplitter::class.java)
-    val jsonFactory = JsonFactory()
-    val jsonParser = jsonFactory.createNonBlockingByteArrayParser() as NonBlockingJsonParser
-    val resFut = CompletableFuture<Void>()
+    private val log: Logger = LoggerFactory.getLogger(JsonSplitter::class.java)
+    private val jsonFactory = JsonFactory()
+    private val jsonParser = jsonFactory.createNonBlockingByteArrayParser() as NonBlockingJsonParser
+    private val resFut = CompletableFuture<Void>()
     val quitLoop = AtomicBoolean(false)
-    var looping = false
+    private var looping = false
     //parser state
-    var objectNestingLevel  = -1
-    var waitingStartObject = true
+    private var objectNestingLevel  = -1
+    private var waitingStartObject = true
     var tokBuf = tokenBuffer()
 
     fun loop() : CompletableFuture<Void> {
@@ -64,7 +65,6 @@ class JsonSplitter(
                         bufsToFeed.add(Pair(inputBuf, nRead))
                         if (jsonParser.needMoreInput()) {
                             val (tot, bufToFeed) = concatAll(bufsToFeed)
-                            //assert equals sofar tot
                             bufsToFeed.clear()
                             jsonParser.feedInput(bufToFeed, 0, tot)
                         }

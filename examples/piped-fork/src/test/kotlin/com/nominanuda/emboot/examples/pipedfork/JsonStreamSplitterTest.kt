@@ -1,24 +1,15 @@
 package com.nominanuda.emboot.examples.pipedfork
 
-import com.fasterxml.jackson.core.JsonFactory
-import com.fasterxml.jackson.core.JsonToken
-import com.fasterxml.jackson.core.JsonTokenId
-import com.fasterxml.jackson.core.json.async.NonBlockingJsonParser
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.databind.util.TokenBuffer
 import org.junit.jupiter.api.Test
 import org.slf4j.LoggerFactory
 import org.springframework.util.StreamUtils
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
-import java.io.StringWriter
 import java.util.concurrent.TimeUnit
 
 class JsonStreamSplitterTest {
     @Test
     fun testSplit() {
-        val fac = JsonFactory()
-        val p = fac.createNonBlockingByteArrayParser() as NonBlockingJsonParser
         val pis = PipedInputStream()
         val pos = PipedOutputStream(pis)
         val chunks = StreamUtils.copyToByteArray(javaClass.classLoader.getResourceAsStream("json-chunks.txt"))
